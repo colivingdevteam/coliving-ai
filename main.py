@@ -1,8 +1,8 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Body, Request, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 import uvicorn
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance
 import io
 import logging
 import os
@@ -12,12 +12,8 @@ from dotenv import load_dotenv
 from typing import List, Dict, Any, Optional
 import json
 from datetime import datetime
-import hashlib
 import base64
-import numpy as np
-import cv2
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 
 # Load environment variables
@@ -34,25 +30,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global variables for multiple models
-processor_blip = None
-model_blip = None
-processor_blip2 = None
-model_blip2 = None
-maintenance_classifier = None
-damage_detector = None
-safety_assessor = None
-cost_estimator = None
+# Hugging Face API Token
 HF_TOKEN = os.getenv("HF_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Hugging Face API URLs (using Inference API instead of loading models)
-BLIP_LARGE_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"  # Changed to base (smaller)
-BLIP2_URL = "https://api-inference.huggingface.co/models/Salesforce/blip2-opt-2.7b"
-LLAMA_URL = "https://api-inference.huggingface.co/models/meta-llama/Llama-2-7b-chat-hf"
-MAINTENANCE_CLASSIFIER_URL = "https://api-inference.huggingface.co/models/course5ai/maintenance-classifier"
-OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
+# Lightweight Hugging Face Inference API URLs
+BLIP_BASE_URL = "https://api-inference.huggingface.co/models/Salesforce/blip-image-captioning-base"
+VIT_GPT2_URL = "https://api-inference.huggingface.co/models/nlpconnect/vit-gpt2-image-captioning"
 
 class AdvancedMaintenanceAnalyzer:
     """Advanced analyzer for maintenance content generation"""
@@ -1174,89 +1157,35 @@ def enhanced_image_processing(image: Image.Image) -> Image.Image:
         return image
 
 
-def multi_model_caption_generation(image: Image.Image) -> str:
-    """Generate captions using multiple models for better accuracy"""
-    
-    captions = []
-    
-    # Use OpenRouter API or Hugging Face Inference API instead of local models
-    # This dramatically reduces memory usage
+async def multi_model_caption_generation(image: Image.Image) -> str:
+    """Generate captions using Hugging Face Inference API"""
     
     try:
-        # Convert PIL Image to bytes for API calls
+        # Convert image to bytes
         img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format='PNG')
-        img_byte_arr.seek(0)
+        image.save(img_byte_arr, format='JPEG')
+        img_byte_arr = img_byte_arr.getvalue()
         
-        # Strategy 1: Try OpenRouter API first (if available)
-        if OPENROUTER_API_KEY:
-            try:
-                # Convert image to base64
-                img_base64 = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-                data_url = f"data:image/png;base64,{img_base64}"
-                
-                response = requests.post(
-                    OPENROUTER_API_URL,
-                    headers={
-                        'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-                        'Content-Type': 'application/json'
-                    },
-                    json={
-                        'model': 'google/gemini-2.0-flash-exp:free',
-                        'messages': [{
-                            'role': 'user',
-                            'content': [
-                                {'type': 'text', 'text': prompt or 'Describe this maintenance issue or damage in detail'},
-                                {'type': 'image_url', 'image_url': {'url': data_url}}
-                            ]
-                        }],
-                        'max_tokens': 150
-                    },
-                    timeout=30
-                )
-                
-                if response.ok:
-                    data = response.json()
-                    caption = data.get('choices', [{}])[0].get('message', {}).get('content', '')
-                    if caption:
-                        captions.append(caption)
-                        logger.info(f"OpenRouter analysis successful")
-                        
-            except Exception as e:
-                logger.warning(f"OpenRouter API failed: {e}")
+        # Try BLIP base model first (lighter and faster)
+        caption = await query_hf_api(img_byte_arr, BLIP_BASE_URL)
         
-        # Strategy 2: Fallback to Hugging Face Inference API
-        if not captions:
-            try:
-                img_byte_arr.seek(0)
-                response = requests.post(
-                    BLIP_LARGE_URL,
-                    headers={"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {},
-                    files={"file": img_byte_arr},
-                    timeout=30
-                )
-                
-                if response.ok:
-                    result = response.json()
-                    if isinstance(result, list) and len(result) > 0:
-                        caption = result[0].get('generated_text', '')
-                        if caption:
-                            captions.append(caption)
-                            logger.info(f"HuggingFace BLIP analysis successful")
-                            
-            except Exception as e:
-                logger.warning(f"HuggingFace BLIP API failed: {e}")
+        if caption and caption != "Unable to analyze image":
+            return caption
+        
+        # Fallback to ViT-GPT2 if BLIP fails
+        caption = await query_hf_api(img_byte_arr, VIT_GPT2_URL)
+        return caption if caption else "Unable to generate description"
         
     except Exception as e:
-        logger.error(f"All API captioning strategies failed: {e}")
+        logger.warning(f"BLIP-2 captioning failed: {e}")
     
     # Select the best caption
     if captions:
+        # Prefer longer, more descriptive captions
         best_caption = max(captions, key=lambda x: len(x.split()))
         return enhance_description(best_caption)
     else:
-        # Return a basic description if all APIs fail
-        return prompt or "Unable to analyze image - please provide description"
+        raise Exception("All captioning strategies failed")
 
 
 def is_valid_caption(caption: str, prompt: str) -> bool:
@@ -1758,15 +1687,15 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    await load_models()
+    # Startup - no models to load, using API-based approach
+    logger.info("Starting API - Using Hugging Face Inference API (no local models)")
     yield
     # Shutdown would go here
 
 app = FastAPI(
-    title="Advanced Maintenance Analysis API - Enhanced Tagalog System",
-    description="Pinakamataas na antas ng sistema para sa pag-generate ng maintenance content mula sa mga larawan at deskripsyon",
-    version="3.0.0",
+    title="Lightweight Maintenance Analysis API - HF Inference",
+    description="Memory-efficient API for maintenance image analysis using Hugging Face Inference API",
+    version="4.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
     lifespan=lifespan
@@ -1781,20 +1710,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ightweight startup - no heavy model loading"""
+# Helper function to call Hugging Face Inference API
+async def query_hf_api(image_bytes: bytes, api_url: str = BLIP_BASE_URL) -> str:
+    """Query Hugging Face Inference API with image"""
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+    
     try:
-        logger.info("API starting in lightweight mode - using remote APIs instead of local models")
-        logger.info("This reduces memory usage from 2-4GB to <100MB")
-        logger.info("Models will be accessed via:")
-        logger.info("  - OpenRouter API (if OPENROUTER_API_KEY is set)")
-        logger.info("  - Hugging Face Inference API (fallback)")
-        logger.info("All models loaded successfully!")
-        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, headers=headers, data=image_bytes) as response:
+                if response.status == 503:
+                    # Model is loading, wait and retry
+                    await asyncio.sleep(2)
+                    async with session.post(api_url, headers=headers, data=image_bytes) as retry_response:
+                        result = await retry_response.json()
+                elif response.status == 200:
+                    result = await response.json()
+                else:
+                    logger.error(f"HF API error: {response.status}")
+                    return "Unable to analyze image"
+                
+                # Parse response
+                if isinstance(result, list) and len(result) > 0:
+                    return result[0].get('generated_text', 'No description available')
+                return str(result)
     except Exception as e:
-        logger.error(f"Error during startup
-    except Exception as e:
-        logger.error(f"Error loading models: {e}")
-        raise e
+        logger.error(f"Error calling HF API: {e}")
+        return "Error analyzing image"
 
 
 # MIDDLEWARE
@@ -1837,8 +1778,8 @@ async def root():
 async def health_check():
     return {
         "status": "healthy", 
-        "models_loaded": model_blip is not None,
-        "blip2_loaded": model_blip2 is not None,
+        "api_mode": "inference_api",
+        "hf_token_configured": HF_TOKEN is not None,
         "timestamp": datetime.now().isoformat()
     }
 
@@ -1846,14 +1787,14 @@ async def health_check():
 @app.post("/analyze-image-advanced")
 async def analyze_image_advanced(file: UploadFile = File(...)):
     """
-    Advanced image analysis with AI expansion and Tagalog translation
+    Lightweight image analysis using Hugging Face Inference API
     """
     try:
         # Validate file
         if not file.content_type.startswith('image/'):
             raise HTTPException(status_code=400, detail="File must be an image")
         
-        logger.info(f"Advanced processing of image: {file.filename}")
+        logger.info(f"Processing image: {file.filename}")
         
         # Read and process image
         image_data = await file.read()
@@ -1870,12 +1811,8 @@ async def analyze_image_advanced(file: UploadFile = File(...)):
         # Enhanced image processing
         enhanced_image = enhanced_image_processing(image)
         
-        # Step 1: Generate basic description
-        try:
-            basic_description = multi_model_caption_generation(enhanced_image)
-        except Exception as local_error:
-            logger.warning(f"Local model processing failed: {local_error}")
-            basic_description = await analyze_with_hf_api_advanced(image_data, file.filename)
+        # Step 1: Generate basic description using HF API
+        basic_description = await multi_model_caption_generation(enhanced_image)
         
         logger.info(f"Basic description: {basic_description}")
         
